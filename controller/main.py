@@ -9,16 +9,20 @@ from operator import itemgetter
 
 class Controller(object):
 
-    def __init__(self, instance_name_tags, boto3_profile='default', cpu_thresh=0.5, shutdown_cpu_thresh=0.005,
+    def __init__(self, instance_name_tags=None, vpc_name_tag=None, central_node_name_tag=None, boto3_profile='default', cpu_thresh=0.5, shutdown_cpu_thresh=0.005,
                  cool_down_mins=5, lookback_mins=10, time_between_checks_mins=1):
         """
         Control nodes based on CPU usage with the supplied parameters.
 
         **IMPORTANT**
-        It is assumed the central node, which is never shutdown, is the first name tag in the list "instance_name_tags"
-        All other nodes will be controlled based on CPU usage.
+        If specifying instance_name_tags, it is assumed the 0th index of this list is the cerntal node.
+        If specifying vpc name tag, all instances are controlled and must specify the name tag of the central node.
 
-        :param instance_name_tags: list of name tags given to the instances
+        **The central node is never shutdown by this script.**
+
+        :param instance_name_tags: list of name tags given to the instances, 0th index is assumed to be central node
+        :param vpc: str - Name tag for the VPC to look for instances
+        :param central_nod_name_tag: str - Name tag of the central node on the VPC
         :param boto3_profile: string name of the boto3 profile to use in the ~/.aws credentials file
         :param cpu_thresh: float between 0-1 for % of CPU load required to initiate starting another node
         :param shutdown_cpu_thresh: float between 0-1 for % required for cool_down_mins before node is shutdown
@@ -30,6 +34,12 @@ class Controller(object):
         self.ec2 = self.session.resource('ec2')
         self.cloud_watch = self.session.client('cloudwatch')
         self.instance_name_tags = instance_name_tags
+        self.vpc_name_tag = vpc_name_tag
+        self.central_node_name_tag = central_node_name_tag
+
+        if not instance_name_tags:
+            assert vpc_name_tag and central_node_name_tag, 'If instance_name_tags is empty, the VPC and central_node should be specified.'
+
         self.boto3_profile = boto3_profile
         self.cpu_thresh = cpu_thresh
         self.shutdown_cpu_thresh = shutdown_cpu_thresh
@@ -46,20 +56,39 @@ class Controller(object):
         """Get a list of the instances"""
         # Create instance and get instance id
 
-        # Find the instance, one by one to ensure error if one is missed; letting the user know.
-        for name_tag in self.instance_name_tags:
-            instance = [inst for inst in self.ec2.instances.filter(Filters=[
-                {'Name': 'tag:Name', 'Values': [name_tag, ]}
-            ])]
-            instance = instance[0] if instance else None
-            if instance is None:
-                raise AttributeError('Could not find the instance with Name tag "{}"'.format(name_tag))
-            else:
-                sys.stdout.write('[{host_name}:] Found instance "{name_tag}" --> {state}\n'
-                                 .format(host_name=self.host_name, name_tag=name_tag, state=instance.state.get('Name')))
-                self.instances.append(instance)
+        # Get instances by vpc and make central node in first place
+        if self.vpc_name_tag and self.central_node_name_tag:
+            for inst in self.ec2.instances.iterator():
 
-        # Turn on detailed monitoring so we can get < 10 min updates on CPU usage.
+                # Ensure this is instance in the VPC
+                if any([(d.get('Key') == 'Name' and d.get('Value') == self.vpc_name_tag) for d in inst.vpc.tags]):
+
+                    # If this is the central node, place in 0th index in instances, otherwise append.
+                    if any([(d.get('Key') == 'Name' and d.get('Value') == self.central_node_name_tag) for d in inst.tags]):
+                        self.instances.insert(0, inst)
+                    else:
+                        self.instances.append(inst)
+
+            # Ensure the 0th place instance is the central node.
+            assert any([(d.get('Key') == 'Name' and d.get('Value') == self.central_node_name_tag) for d in self.instances[0].tags]), \
+            'Unable to find the central node in the VPC!'
+
+        # Get instances by instance_name_tags, central node assumed to be 0th place
+        else:
+            # Find the instance, one by one to ensure error if one is missed; letting the user know.
+            for name_tag in self.instance_name_tags:
+                instance = [inst for inst in self.ec2.instances.filter(Filters=[
+                    {'Name': 'tag:Name', 'Values': [name_tag, ]}
+                ])]
+                instance = instance[0] if instance else None
+                if instance is None:
+                    raise AttributeError('Could not find the instance with Name tag "{}"'.format(name_tag))
+                else:
+                    sys.stdout.write('[{host_name}:] Found instance "{name_tag}" --> {state}\n'
+                                     .format(host_name=self.host_name, name_tag=name_tag, state=instance.state.get('Name')))
+                    self.instances.append(instance)
+
+        # Turn on detailed monitoring so we can get 1 min updates on CPU usage.
         [inst.monitor() for inst in self.instances]
 
 
@@ -163,15 +192,17 @@ class Controller(object):
 
             # Loop for stopping instances
             for i, instance in enumerate(self.instances):
-                if i == 0 or instance.state.get('Name') != 'running': continue  # Never shutdown central node.
+                if i == 0 or instance.state.get('Name') != 'running': continue  # Never shutdown central node or non running nodes.
 
                 # If the usage is under the shutdown thresh, has been for over 'cool_down_mins',
-                # and at least one other node is below cpu_thresh as well, then shut it down.
+                # and at least one other node is below cpu_thresh as well, then shut this one down.
                 if (self.get_useage(instance_id=instance.id) <= self.shutdown_cpu_thresh
                     and any([self.get_useage(inst.id) < self.cpu_thresh for inst in self.instances if inst.state.get('Name') == 'running' and inst.id != instance.id])
                     ):
                     if stop_flags[instance.id] is not None and (time.clock() - stop_flags[instance.id]) / 60 > self.cool_down_mins:
                         self.start_or_stop_instance(instance, operation='stop')
+                        time.sleep(60 * 5)  # wait 5 minutes for rest of cluster to adjust to this node shutting down.
+                        break
                     elif stop_flags[instance.id] is None:
                         sys.stdout.write('[{}:] Placing instance {} into cool down queue, will shutoff in {} mins if other cluster nodes\' CPUs stay below cpu_thresh.\n'
                                          .format(self.host_name, instance.private_dns_name, self.cool_down_mins))
