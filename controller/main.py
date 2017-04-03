@@ -141,20 +141,18 @@ class Controller(object):
             for i, instance in enumerate(self.instances):
 
                 # If this instance is over cpu useage, and all other running ones are as well, start another one.
-                cpu_load = self.get_useage(instance_id=instance.id)
-                if (cpu_load > self.cpu_thresh
-                    and all([self.get_useage(inst.id) > self.cpu_thresh for inst in self.instances if inst.state.get('Name') == 'running'])
-                    ):
+                if all([self.get_useage(inst.id) > self.cpu_thresh for inst in self.instances if inst.state.get('Name') == 'running']):
 
                     # Find an instance that isn't running and start it, or log there are no instances left.
                     instance_to_start = next(iter([inst for inst in self.instances if inst.state.get('Name') == 'stopped']), None)
                     if instance_to_start is not None:
-                        sys.stdout.write(
-                            '[{}:] Instance {} over CPU thresh: {} now at {}, starting another instance: {}\n'
-                            .format(self.host_name, instance.private_dns_name, self.cpu_thresh, cpu_load, instance_to_start.private_dns_name)
-                        )
+                        cpu_load = self.get_useage(instance_id=instance.id)
+                        sys.stdout.write('[{}:] Instance {} over CPU thresh: {} now at {}, starting another instance: {}\n'
+                                         .format(self.host_name, instance.private_dns_name, self.cpu_thresh, cpu_load, instance_to_start.private_dns_name)
+                                         )
                         self.start_or_stop_instance(instance_to_start)
                         stop_flags[instance_to_start.id] = None  # Ensure the stop flag is none for now
+                        time.sleep(60 * 5)  # Sleep for 5 minutes, give vm time to start and cpu to settle.
                     else:
                         sys.stdout.write('[{hostname}:] All nodes are currently over CPU threshold!\n'
                                          .format(hostname=self.host_name))
